@@ -28,7 +28,6 @@ Die iPhone-Web-App läuft ausschließlich über HTTPS. Für den lokalen Automate
 cd raspberry_pi
 chmod +x setup_local_https.sh
 ./setup_local_https.sh raspberrypi.local 192.168.178.50
-export MAOM_SERIAL_PORT=/dev/ttyACM0
 export MAOM_TLS_CERT="$HOME/maom-tls/maom-cert.pem"
 export MAOM_TLS_KEY="$HOME/maom-tls/maom-key.pem"
 python3 automaten_server.py

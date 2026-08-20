@@ -1,0 +1,14 @@
+# Local runtime data and credentials: never publish these.
+__pycache__/
+*.py[cod]
+*.log
+raspberry_pi/automaten_state.json
+*.pem
+*.key
+*.crt
+maom-tls/
+
+# Local tooling
+.venv/
+.vscode/
+.idea/

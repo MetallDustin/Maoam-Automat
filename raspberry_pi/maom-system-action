@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+  reboot)
+    exec /usr/bin/systemctl reboot
+    ;;
+  shutdown)
+    exec /usr/bin/systemctl poweroff
+    ;;
+  *)
+    echo "Usage: maom-system-action {reboot|shutdown}" >&2
+    exit 2
+    ;;
+esac

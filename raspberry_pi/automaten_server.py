@@ -1,18 +1,23 @@
 """MAOM-Automat: Raspberry-Pi-Steuerung fuer den Arduino Mega."""
+import copy
+import hashlib
 import json
 import os
-import threading
-import time
-import hashlib
 import secrets
 import subprocess
+import tempfile
+import threading
+import time
 from functools import wraps
 
 import serial
 from flask import Flask, Response, redirect, render_template_string, request, session, url_for
 
-SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = os.environ.get("MAOM_SERIAL_PORT", "/dev/ttyACM0")
 BAUDRATE = 9600
+SERIAL_RETRY_SECONDS = 2
+HEARTBEAT_INTERVAL_SECONDS = 2
+HEARTBEAT_TIMEOUT_SECONDS = 5
 WEB_PORT = int(os.environ.get("MAOM_PORT", "8443"))
 TLS_CERT_FILE = os.environ.get("MAOM_TLS_CERT", "")
 TLS_KEY_FILE = os.environ.get("MAOM_TLS_KEY", "")
@@ -29,21 +34,27 @@ DEFAULT_STATE = {
     "audit": [],
     "servo": [{"home": 0, "output": 90, "out_ms": 450, "back_ms": 450} for _ in range(SLOTS)],
     "selection_timeout": 30,
+    "hardware_error": "",
 }
 
 lock = threading.RLock()
 serial_lock = threading.Lock()
-state = DEFAULT_STATE.copy()
+state = copy.deepcopy(DEFAULT_STATE)
 ser = None
+mega_ready = False
+persistence_error = ""
 vend_in_progress = False
 service_mode = True  # Sicherer Start, bis der Mega den Schluesselstatus gemeldet hat.
 selected_slot = None
 selected_quantity = 0
 pending_dispenses = 0
+active_dispense_slot = None
 selection_changed_at = 0.0
+last_pong_at = 0.0
 last_key_on = None
 KEY_ON_IS_SERVICE = True
 STARTUP_ANIMATION_SECONDS = 9
+startup_animation_finished = False
 
 
 def load_state():
@@ -51,21 +62,97 @@ def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as file:
             saved = json.load(file)
-        if len(saved.get("slots", [])) == SLOTS:
-            state.update(saved)
-    except (OSError, ValueError, TypeError):
-        pass
+    except FileNotFoundError:
+        state = copy.deepcopy(DEFAULT_STATE)
+        return
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Zustandsdatei kann nicht gelesen werden: {STATE_FILE}") from error
+
+    if not isinstance(saved, dict):
+        raise RuntimeError("Die Zustandsdatei muss ein JSON-Objekt enthalten.")
+    required_keys = ("enabled", "revenue", "slots", "users")
+    missing_keys = [key for key in required_keys if key not in saved]
+    if missing_keys:
+        raise RuntimeError("Unvollständige Zustandsdatei; fehlt: " + ", ".join(missing_keys))
+
+    loaded = copy.deepcopy(DEFAULT_STATE)
+    loaded.update(saved)
+    if type(loaded["enabled"]) is not bool:
+        raise RuntimeError("Ungültiger Wert für 'enabled' in der Zustandsdatei.")
+    if type(loaded["revenue"]) is not int or loaded["revenue"] < 0:
+        raise RuntimeError("Ungültiger Umsatz in der Zustandsdatei.")
+    if not isinstance(loaded["slots"], list) or len(loaded["slots"]) != SLOTS:
+        raise RuntimeError(f"Die Zustandsdatei muss genau {SLOTS} Fächer enthalten.")
+    for number, slot in enumerate(loaded["slots"], 1):
+        if not isinstance(slot, dict) or not isinstance(slot.get("name"), str):
+            raise RuntimeError(f"Ungültige Daten für Fach {number} in der Zustandsdatei.")
+        for field, minimum in (("price", 1), ("stock", 0), ("sold", 0), ("sales_revenue", 0)):
+            value = slot.get(field, 0 if field != "price" else 20)
+            if type(value) is not int or value < minimum:
+                raise RuntimeError(f"Ungültiger Wert für '{field}' in Fach {number}.")
+            slot[field] = value
+    if not isinstance(loaded["users"], list):
+        raise RuntimeError("Ungültige Benutzerliste in der Zustandsdatei.")
+    for user in loaded["users"]:
+        if (not isinstance(user, dict) or not isinstance(user.get("name"), str)
+                or not isinstance(user.get("password"), str)
+                or user.get("role") not in ("admin", "manager", "refill", "viewer")):
+            raise RuntimeError("Ungültiger Benutzer in der Zustandsdatei.")
+    if not isinstance(loaded["admin_pin_hash"], str):
+        raise RuntimeError("Ungültiger Admin-PIN in der Zustandsdatei.")
+    if not isinstance(loaded["audit"], list):
+        raise RuntimeError("Ungültiges Protokoll in der Zustandsdatei.")
+    if not isinstance(loaded["servo"], list) or len(loaded["servo"]) != SLOTS:
+        raise RuntimeError(f"Die Zustandsdatei muss genau {SLOTS} Servo-Konfigurationen enthalten.")
+    for number, config in enumerate(loaded["servo"], 1):
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Ungültige Servo-Konfiguration für Fach {number}.")
+        for field, minimum, maximum in (
+            ("home", 0, 180), ("output", 0, 180), ("out_ms", 50, 5000), ("back_ms", 50, 5000)
+        ):
+            value = config.get(field, DEFAULT_STATE["servo"][number - 1][field])
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise RuntimeError(f"Ungültiger Wert für '{field}' bei Servo {number}.")
+            config[field] = value
+    if type(loaded["selection_timeout"]) is not int or not 5 <= loaded["selection_timeout"] <= 300:
+        raise RuntimeError("Ungültiger Auswahl-Timeout in der Zustandsdatei.")
+    if not isinstance(loaded["hardware_error"], str):
+        raise RuntimeError("Ungültiger Hardware-Fehlerstatus in der Zustandsdatei.")
+
+    state = loaded
     state["credit"] = 0  # Kein Guthaben nach einem Neustart uebernehmen.
-    # Alte gespeicherte Daten ohne Statistik-Felder automatisch erweitern.
-    for slot in state["slots"]:
-        slot.setdefault("sold", 0)
-        slot.setdefault("sales_revenue", 0)
 
 
 def save_state():
-    persistent = {key: value for key, value in state.items() if key != "credit"}
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(persistent, file, ensure_ascii=False, indent=2)
+    global persistence_error
+    with lock:
+        persistent = {key: value for key, value in state.items() if key != "credit"}
+        temporary_path = None
+        try:
+            directory = os.path.dirname(os.path.abspath(STATE_FILE))
+            os.makedirs(directory, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".automaten_state.", suffix=".tmp", dir=directory
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                json.dump(persistent, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            if os.name != "nt":
+                os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, STATE_FILE)
+        except OSError as error:
+            persistence_error = "Speicherfehler: Verkauf gesperrt, bis der Zustand sicher gespeichert werden kann."
+            print("Zustand konnte nicht gespeichert werden:", error)
+            send("RELAY OFF")
+            send("LEDS OFF")
+            raise
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError as error:
+                    print("Temporäre Zustandsdatei konnte nicht entfernt werden:", error)
 
 
 def password_hash(value, salt=None):
@@ -88,19 +175,29 @@ def euro(cents):
 
 
 def audit(action):
-    state.setdefault("audit", []).append({"time": time.strftime("%d.%m.%Y %H:%M"), "user": session.get("user", "System"), "action": action})
-    state["audit"] = state["audit"][-120:]
-    save_state()
+    with lock:
+        state.setdefault("audit", []).append({"time": time.strftime("%d.%m.%Y %H:%M"), "user": session.get("user", "System"), "action": action})
+        state["audit"] = state["audit"][-120:]
+        save_state()
 
 
 def send(line):
-    if ser is None:
-        print("Mega nicht verbunden:", line)
-        return
+    error = None
     with serial_lock:
-        ser.write((line + "\n").encode("utf-8"))
-        ser.flush()
+        connection = ser
+        if connection is None or not mega_ready:
+            print("Mega nicht bereit; Befehl nicht gesendet:", line)
+            return False
+        try:
+            connection.write((line + "\n").encode("utf-8"))
+            connection.flush()
+        except (serial.SerialException, OSError, ValueError) as caught:
+            error = caught
+    if error is not None:
+        serial_disconnected(connection, error)
+        return False
     print(">>", line)
+    return True
 
 
 def lcd(line1="", line2=""):
@@ -118,14 +215,18 @@ def any_stock():
 
 
 def is_operational():
-    return state["enabled"] and not service_mode
+    return state["enabled"] and not service_mode and mega_ready and not state["hardware_error"] and not persistence_error
 
 
 def machine_issues():
     """Technische Hinweise fuer die Verwaltung; am LCD erscheinen nur allgemeine Texte."""
     issues = []
-    if ser is None:
+    if not mega_ready:
         issues.append("Arduino Mega nicht verbunden")
+    if state["hardware_error"]:
+        issues.append(state["hardware_error"])
+    if persistence_error:
+        issues.append(persistence_error)
     empty = [str(number) for number, slot in enumerate(state["slots"], 1) if slot["stock"] <= 0]
     if empty:
         issues.append("Leer: Fach " + ", ".join(empty))
@@ -168,15 +269,35 @@ def update_hardware(message=None):
 
 
 def handle_line(line):
-    global vend_in_progress, service_mode, selected_slot, selected_quantity, pending_dispenses, selection_changed_at, last_key_on
+    global vend_in_progress, service_mode, selected_slot, selected_quantity
+    global pending_dispenses, active_dispense_slot, selection_changed_at, last_key_on, mega_ready
+    global startup_animation_finished, last_pong_at
     print("<<", line)
+    if line == "PONG":
+        with lock:
+            last_pong_at = time.monotonic()
+        return
+    if line == "READY":
+        with serial_lock:
+            mega_ready = True
+        with lock:
+            last_pong_at = time.monotonic()
+            apply_servo_settings()
+            if startup_animation_finished:
+                send("STARTUP DONE")
+            update_hardware()
+        return
     with lock:
         if line.startswith("COIN "):
             try:
-                cents = int(line.split()[1])
-            except (IndexError, ValueError):
+                parts = line.split()
+                if len(parts) != 2:
+                    return
+                cents = int(parts[1])
+            except ValueError:
                 return
             if is_operational() and selected_slot is not None and not vend_in_progress and cents in (5, 10, 20):
+                credit_before_coin = state["credit"]
                 state["credit"] += cents
                 slot = state["slots"][selected_slot]
                 total = slot["price"] * selected_quantity
@@ -186,9 +307,19 @@ def handle_line(line):
                     state["revenue"] += total
                     slot["sold"] = int(slot.get("sold", 0)) + selected_quantity
                     slot["sales_revenue"] = int(slot.get("sales_revenue", 0)) + total
-                    save_state()
+                    try:
+                        save_state()
+                    except OSError:
+                        slot["stock"] += selected_quantity
+                        state["revenue"] -= total
+                        slot["sold"] -= selected_quantity
+                        slot["sales_revenue"] -= total
+                        state["credit"] = credit_before_coin + cents
+                        update_hardware()
+                        return
                     vend_in_progress = True
                     pending_dispenses = selected_quantity
+                    active_dispense_slot = selected_slot
                     send("RELAY OFF"); send("LEDS OFF")
                     lcd("Ausgabe laeuft", f"{selected_quantity}x {slot['name']}")
                     send(f"DISPENSE {selected_slot + 1}")
@@ -196,8 +327,11 @@ def handle_line(line):
                     update_hardware()
         elif line.startswith("BUTTON "):
             try:
-                index = int(line.split()[1]) - 1
-            except (IndexError, ValueError):
+                parts = line.split()
+                if len(parts) != 2:
+                    return
+                index = int(parts[1]) - 1
+            except ValueError:
                 return
             if not (0 <= index < SLOTS) or vend_in_progress or not is_operational():
                 return
@@ -218,31 +352,101 @@ def handle_line(line):
             selection_changed_at = time.monotonic()
             update_hardware()
         elif line.startswith("OK ") and vend_in_progress:
+            try:
+                parts = line.split()
+                if len(parts) != 2:
+                    return
+                acknowledged_slot = int(parts[1]) - 1
+            except ValueError:
+                return
+            if (not 0 <= acknowledged_slot < SLOTS or acknowledged_slot != active_dispense_slot
+                    or pending_dispenses <= 0):
+                print("Unerwartete Ausgabe-Bestätigung ignoriert:", line)
+                return
             pending_dispenses -= 1
             if pending_dispenses > 0:
-                send(f"DISPENSE {selected_slot + 1}")
+                send(f"DISPENSE {active_dispense_slot + 1}")
             else:
                 vend_in_progress = False
+                active_dispense_slot = None
                 selected_slot = None
                 selected_quantity = 0
                 selection_changed_at = 0.0
                 update_hardware()
-        elif line.startswith("KEY "):
+        elif line in ("KEY ON", "KEY OFF"):
             key_on = line == "KEY ON"
             last_key_on = key_on
             service_mode = key_on if KEY_ON_IS_SERVICE else not key_on
-            selected_slot = None
-            selected_quantity = 0
-            selection_changed_at = 0.0
             state["credit"] = 0
+            if not vend_in_progress:
+                selected_slot = None
+                selected_quantity = 0
+                selection_changed_at = 0.0
             update_hardware()
+
+
+def serial_disconnected(connection, error):
+    global ser, mega_ready, service_mode, last_key_on
+    global vend_in_progress, selected_slot, selected_quantity
+    global pending_dispenses, active_dispense_slot, selection_changed_at, last_pong_at
+    with serial_lock:
+        if ser is not connection:
+            return
+        ser = None
+        mega_ready = False
+    print("Serielle Verbindung getrennt:", error)
+    try:
+        connection.close()
+    except (serial.SerialException, OSError, ValueError):
+        pass
+    with lock:
+        last_pong_at = 0.0
+        service_mode = True
+        last_key_on = None
+        selected_slot = None
+        selected_quantity = 0
+        selection_changed_at = 0.0
+        state["credit"] = 0
+        if vend_in_progress:
+            state["hardware_error"] = (
+                "Verbindung während einer Ausgabe unterbrochen. Ware und Bestand prüfen."
+            )
+            vend_in_progress = False
+            pending_dispenses = 0
+            active_dispense_slot = None
+            try:
+                save_state()
+            except OSError as save_error:
+                print("Ausgabe-Prüfhinweis konnte nicht gespeichert werden:", save_error)
+
+
+def connect_serial():
+    global ser, mega_ready
+    try:
+        connection = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.2, write_timeout=1)
+    except (serial.SerialException, OSError, ValueError) as error:
+        print(f"Mega unter {SERIAL_PORT} nicht erreichbar; neuer Versuch in {SERIAL_RETRY_SECONDS}s: {error}")
+        return False
+    with serial_lock:
+        ser = connection
+        mega_ready = False
+    print("Serielle Verbindung geöffnet; warte auf READY vom Mega.")
+    return True
 
 
 def serial_loop():
     global selected_slot, selected_quantity, selection_changed_at
+    last_ping_at = 0.0
     while True:
+        with serial_lock:
+            connection = ser
+        if connection is None:
+            last_ping_at = 0.0
+            if not connect_serial():
+                time.sleep(SERIAL_RETRY_SECONDS)
+            continue
         try:
-            line = ser.readline().decode("utf-8", errors="replace").strip()
+            line = connection.readline().decode("utf-8", errors="replace").strip()
             if line:
                 handle_line(line)
             with lock:
@@ -253,14 +457,32 @@ def serial_loop():
                     selection_changed_at = 0.0
                     lcd("Auswahl beendet", "Bitte neu waehlen")
                     update_hardware()
+            now = time.monotonic()
+            with serial_lock:
+                ready = mega_ready
+            if ready and now - last_ping_at >= HEARTBEAT_INTERVAL_SECONDS:
+                if send("PING"):
+                    last_ping_at = now
+            with lock:
+                pong_at = last_pong_at
+            if ready and pong_at and now - pong_at > HEARTBEAT_TIMEOUT_SECONDS:
+                serial_disconnected(connection, serial.SerialException("Keine PONG-Antwort vom Mega"))
         except serial.SerialException as error:
-            print("Serieller Fehler:", error)
-            time.sleep(2)
+            serial_disconnected(connection, error)
+            time.sleep(SERIAL_RETRY_SECONDS)
+        except OSError as error:
+            serial_disconnected(connection, error)
+            time.sleep(SERIAL_RETRY_SECONDS)
+        except ValueError as error:
+            serial_disconnected(connection, error)
+            time.sleep(SERIAL_RETRY_SECONDS)
 
 
 def finish_startup_animation():
     """Beendet die Mega-Startanimation und stellt den echten LED-Status her."""
+    global startup_animation_finished
     with lock:
+        startup_animation_finished = True
         send("STARTUP DONE")
         update_hardware()
 
@@ -275,8 +497,9 @@ app.secret_key = os.environ.get("MAOM_SESSION_SECRET", secrets.token_hex(32))
 
 
 def current_user():
-    name = session.get("user")
-    return next((item for item in state.get("users", []) if item["name"] == name), None)
+    with lock:
+        name = session.get("user")
+        return next((item for item in state.get("users", []) if item["name"] == name), None)
 
 
 def has_role(*roles):
@@ -296,7 +519,8 @@ def role_required(*roles):
 
 
 def admin_pin_ok():
-    return has_role("admin") and password_matches(request.form.get("pin", ""), state.get("admin_pin_hash", ""))
+    with lock:
+        return has_role("admin") and password_matches(request.form.get("pin", ""), state.get("admin_pin_hash", ""))
 
 
 def return_to_page():
@@ -310,10 +534,11 @@ def login_required():
     allowed = {"setup", "login", "manifest", "service_worker", "icon"}
     if request.endpoint in allowed or request.path.startswith("/static/"):
         return None
-    if not state.get("users"):
-        return redirect(url_for("setup"))
-    if not current_user():
-        return redirect(url_for("login"))
+    with lock:
+        if not state.get("users"):
+            return redirect(url_for("setup"))
+        if not current_user():
+            return redirect(url_for("login"))
     return None
 
 
@@ -322,16 +547,23 @@ AUTH_TEMPLATE = """<!doctype html><meta name=viewport content='width=device-widt
 
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
-    if state.get("users"):
-        return redirect(url_for("login"))
+    with lock:
+        if state.get("users"):
+            return redirect(url_for("login"))
     error = ""
     if request.method == "POST":
         name, password, pin = request.form.get("name", "").strip(), request.form.get("password", ""), request.form.get("pin", "")
         if len(name) < 3 or len(password) < 8 or not (pin.isdigit() and 4 <= len(pin) <= 12): error = "Bitte gültige Daten eingeben."
         else:
-            state["users"] = [{"name": name, "password": password_hash(password), "role": "admin"}]
-            state["admin_pin_hash"] = password_hash(pin); save_state(); session["user"] = name; audit("Admin-Ersteinrichtung")
-            return redirect("/")
+            with lock:
+                if state.get("users"):
+                    return redirect(url_for("login"))
+                state["users"] = [{"name": name, "password": password_hash(password), "role": "admin"}]
+                state["admin_pin_hash"] = password_hash(pin)
+                save_state()
+                session["user"] = name
+                audit("Admin-Ersteinrichtung")
+                return redirect("/")
     return render_template_string(AUTH_TEMPLATE, text="Ersten Administrator einrichten.", button="Admin-Konto erstellen", error=error, setup=True)
 
 
@@ -339,9 +571,12 @@ def setup():
 def login():
     error = ""
     if request.method == "POST":
-        user = next((u for u in state.get("users", []) if u["name"] == request.form.get("name", "").strip()), None)
-        if user and password_matches(request.form.get("password", ""), user["password"]):
-            session["user"] = user["name"]; audit("Anmeldung"); return redirect("/")
+        with lock:
+            user = next((u for u in state.get("users", []) if u["name"] == request.form.get("name", "").strip()), None)
+            if user and password_matches(request.form.get("password", ""), user["password"]):
+                session["user"] = user["name"]
+                audit("Anmeldung")
+                return redirect("/")
         error = "Anmeldung nicht möglich."
     return render_template_string(AUTH_TEMPLATE, text="Bitte anmelden.", button="Anmelden", error=error, setup=False)
 
@@ -354,7 +589,7 @@ def logout():
 @app.get("/api/status")
 def api_status():
     with lock:
-        return {"status": "Betriebsbereit" if is_operational() else "Wartungsmodus", "operational": is_operational(), "key": "nicht erkannt" if last_key_on is None else ("AN" if last_key_on else "AUS"), "credit": state["credit"], "revenue": state["revenue"], "revenue_eur": euro(state["revenue"]), "mega": "verbunden" if ser is not None else "nicht verbunden", "busy": vend_in_progress, "issues": machine_issues()}
+        return {"status": "Betriebsbereit" if is_operational() else "Wartungsmodus", "operational": is_operational(), "key": "nicht erkannt" if last_key_on is None else ("AN" if last_key_on else "AUS"), "credit": state["credit"], "revenue": state["revenue"], "revenue_eur": euro(state["revenue"]), "mega": "verbunden" if mega_ready else "nicht verbunden", "busy": vend_in_progress, "issues": machine_issues()}
 
 
 @app.post("/users")
@@ -363,9 +598,10 @@ def add_user():
     name = request.form.get("name", "").strip()[:24]
     password = request.form.get("password", "")
     role = request.form.get("role", "viewer")
-    if name and len(password) >= 8 and role in ("admin", "manager", "refill", "viewer") and not any(u["name"] == name for u in state["users"]):
-        state["users"].append({"name": name, "password": password_hash(password), "role": role})
-        audit(f"Benutzer {name} angelegt ({role})")
+    with lock:
+        if name and len(password) >= 8 and role in ("admin", "manager", "refill", "viewer") and not any(u["name"] == name for u in state["users"]):
+            state["users"].append({"name": name, "password": password_hash(password), "role": role})
+            audit(f"Benutzer {name} angelegt ({role})")
     return return_to_page()
 
 
@@ -375,10 +611,11 @@ def change_user_role(name):
     if not admin_pin_ok() or name == session.get("user"):
         return return_to_page()
     role = request.form.get("role", "")
-    account = next((u for u in state["users"] if u["name"] == name), None)
-    if account and role in ("admin", "manager", "refill", "viewer"):
-        account["role"] = role
-        audit(f"Rechte von {name} geändert: {role}")
+    with lock:
+        account = next((u for u in state["users"] if u["name"] == name), None)
+        if account and role in ("admin", "manager", "refill", "viewer"):
+            account["role"] = role
+            audit(f"Rechte von {name} geändert: {role}")
     return return_to_page()
 
 
@@ -387,10 +624,11 @@ def change_user_role(name):
 def delete_user(name):
     if not admin_pin_ok() or name == session.get("user"):
         return return_to_page()
-    before = len(state["users"])
-    state["users"] = [u for u in state["users"] if u["name"] != name]
-    if len(state["users"]) != before:
-        audit(f"Benutzer {name} gelöscht")
+    with lock:
+        before = len(state["users"])
+        state["users"] = [u for u in state["users"] if u["name"] != name]
+        if len(state["users"]) != before:
+            audit(f"Benutzer {name} gelöscht")
     return return_to_page()
 
 
@@ -398,19 +636,27 @@ def delete_user(name):
 @role_required("admin")
 def restart_service():
     if admin_pin_ok():
-        # Der Dienst selbst läuft bewusst ohne root-Rechte. Der Neustart wird
-        # erst aktiviert, wenn dafür eine eng begrenzte sudo-Regel eingerichtet ist.
-        audit("Software-Neustart angefordert (noch nicht freigegeben)")
+        return "Software-Neustart ist nicht eingerichtet.", 501
     return return_to_page()
 
 
 @app.post("/system/<action>")
-@role_required("admin", "manager")
+@role_required("admin")
 def system_action(action):
-    if action not in ("reboot", "shutdown"):
+    if action not in ("reboot", "shutdown") or not admin_pin_ok():
         return return_to_page()
+    try:
+        subprocess.run(
+            ["sudo", "-n", "/usr/local/sbin/maom-system-action", action],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print("Systemaktion konnte nicht gestartet werden:", error)
+        return "Systemaktion nicht eingerichtet oder nicht erlaubt. Siehe docs/BUILD.md.", 503
     audit("Raspberry Pi " + ("Neustart" if action == "reboot" else "Herunterfahren") + " angefordert")
-    subprocess.Popen(["sudo", "/usr/local/sbin/maom-system-action", action], start_new_session=True)
     return return_to_page()
 
 APP_TEMPLATE = """<!doctype html>
@@ -442,11 +688,11 @@ MENU_LIVE_EXTENSION = """<style>
 .menu-button{position:fixed;top:calc(env(safe-area-inset-top) + 16px);left:14px;z-index:22;width:46px;min-height:46px;border-radius:14px;background:#222a3b;font-size:23px}.nav.drawer{z-index:21;top:0;bottom:0;left:0;right:auto;width:276px;padding:max(116px,calc(env(safe-area-inset-top) + 56px)) 14px 20px;background:#121724;transform:translateX(-105%);transition:transform .22s ease;display:block;border-right:1px solid #303a51;border-top:0}.nav.drawer.open{transform:translateX(0)}.nav.drawer .navin{display:grid;grid-template-columns:1fr;gap:8px}.nav.drawer a{text-align:left;font-size:16px;padding:14px}.scrim{position:fixed;z-index:20;inset:0;background:#0009;display:none}.scrim.show{display:block}.top{padding-left:48px}main{padding-top:max(82px,calc(env(safe-area-inset-top) + 72px))}
 </style><button class='menu-button' id='menu' aria-label='Menü'>☰</button><div class='scrim' id='scrim'></div><script>
 const nav=document.querySelector('.nav'),menu=document.querySelector('#menu'),scrim=document.querySelector('#scrim');nav.classList.add('drawer');const closeMenu=()=>{nav.classList.remove('open');scrim.classList.remove('show')};menu.onclick=()=>{nav.classList.add('open');scrim.classList.add('show')};scrim.onclick=closeMenu;
-document.querySelectorAll('form:not([data-pin])').forEach(form=>form.addEventListener('submit',async e=>{if(form.action.includes('/logout'))return;e.preventDefault();await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin'});location.reload()}));
+document.querySelectorAll('form:not([data-pin])').forEach(form=>form.addEventListener('submit',async e=>{if(form.action.includes('/logout'))return;e.preventDefault();const response=await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin'});if(!response.ok){alert(await response.text());return}location.reload()}));
 async function live(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());const status=document.querySelector('.status b'),sub=document.querySelector('.status .sub');if(status){status.textContent=s.status;status.className=s.operational?'ok':'warn'}if(sub)sub.textContent=' · Schlüssel '+s.key+' · Mega '+s.mega;const cards=document.querySelectorAll('.stat b');if(cards.length>1){cards[0].textContent=s.revenue+' ct';cards[1].textContent=s.credit+' ct'}}catch(e){}}live();setInterval(live,1200);
 </script>"""
 NEW_TEMPLATE = NEW_TEMPLATE.replace("</body>", MENU_LIVE_EXTENSION + "</body>")
-NEW_TEMPLATE = NEW_TEMPLATE.replace("pending.submit()", "fetch(pending.action,{method:'POST',body:new FormData(pending),credentials:'same-origin'}).then(()=>location.reload())")
+NEW_TEMPLATE = NEW_TEMPLATE.replace("pending.submit()", "fetch(pending.action,{method:'POST',body:new FormData(pending),credentials:'same-origin'}).then(async response=>{if(!response.ok){alert(await response.text());return}location.reload()})")
 
 MODERN_STYLE = """<style>
 body{background:radial-gradient(700px 420px at 0% 0%,#21162f 0%,transparent 62%),radial-gradient(600px 360px at 100% 100%,#111d35 0%,transparent 64%),linear-gradient(155deg,#080a10,#0b0e17 52%,#070910)}.top h1{letter-spacing:-.8px;font-size:27px}.status,.stat,.card{background:linear-gradient(145deg,#1a2030dd,#111520e8);backdrop-filter:blur(18px);border-color:#34405a;box-shadow:0 10px 28px #0003}.status{border-left:3px solid var(--pink)}.stat b{font-size:26px;letter-spacing:-.6px}.card{border-radius:22px;padding:17px}.grid{gap:12px}.label{line-height:1.45}.nav.drawer{background:linear-gradient(160deg,#171c2b,#0e121d)}.nav.drawer a{border:1px solid transparent}.nav.drawer a.active{background:linear-gradient(135deg,#ff4f7e,#a44cff);box-shadow:0 8px 20px #a44cff38}.menu-button{background:linear-gradient(135deg,#ff4f7e,#9d4dff);box-shadow:0 8px 22px #9d4dff55}.pinbox{background:linear-gradient(160deg,#20283a,#111624);box-shadow:0 30px 70px #0009}button{background:linear-gradient(135deg,#ff4f7e,#b348ef);box-shadow:0 7px 16px #b348ef35}button.soft{box-shadow:none}.slot{border-color:#2d3850}
@@ -461,17 +707,18 @@ NEW_TEMPLATE = NEW_TEMPLATE.replace("#9d4dff55", "#397dff55")
 NEW_TEMPLATE = NEW_TEMPLATE.replace("#ff4f7e,#b348ef", "#397dff,#3fbdff")
 NEW_TEMPLATE = NEW_TEMPLATE.replace("#b348ef35", "#397dff35")
 NEW_TEMPLATE = NEW_TEMPLATE.replace("#21162f", "#14254a").replace("#111d35", "#102d4d")
-NEW_TEMPLATE = NEW_TEMPLATE.replace("</header>", "</header>{% if user.role=='manager' %}<a class='card' style='display:block;text-decoration:none;color:#fff' href='/?page=tech'>Raspberry Pi</a>{% endif %}")
 NEW_TEMPLATE = NEW_TEMPLATE.replace("</body>", "<script>document.querySelectorAll('.nav a').forEach(a=>{if(a.href.includes('page=admin'))a.textContent='Benutzer'})</script></body>")
 USER_LIST_OLD = """<br>{% for a in users %}<div class=label>{{a.name}} · {{a.role}}</div>{% endfor %}</section>"""
 USER_LIST_NEW = """<br>{% for a in users %}<div class='slot'><b>{{a.name}}</b><div class='label'>Aktuelle Rolle: {{a.role}}</div>{% if a.name == user.name %}<p class='label'>Dein eigenes Konto ist geschützt.</p>{% else %}<form class='row' data-pin method='post' action='/users/{{a.name}}/role'><select name=role><option value=admin {% if a.role=='admin' %}selected{% endif %}>Admin</option><option value=manager {% if a.role=='manager' %}selected{% endif %}>Verwalter</option><option value=refill {% if a.role=='refill' %}selected{% endif %}>Auffüller</option><option value=viewer {% if a.role=='viewer' %}selected{% endif %}>Ansicht</option></select><button>Rechte speichern</button></form><form data-pin method='post' action='/users/{{a.name}}/delete'><button class=danger>Benutzer löschen</button></form>{% endif %}</div>{% endfor %}</section>"""
 NEW_TEMPLATE = NEW_TEMPLATE.replace(USER_LIST_OLD, USER_LIST_NEW)
 TIMEOUT_PANEL = """{% if page=='tech' and user.role=='admin' %}<section class='card'><h2>Auswahl-Timeout</h2><p class='label'>Ohne Geldeinwurf wird die Auswahl nach dieser Zeit zurückgesetzt.</p><form class='row' data-pin method='post' action='/tech/selection-timeout'><input name=seconds inputmode=numeric value='{{selection_timeout}}'><span class='label'>Sekunden</span><button>Speichern</button></form></section>{% endif %}"""
 NEW_TEMPLATE = NEW_TEMPLATE.replace("</main>", TIMEOUT_PANEL + "</main>")
-SYSTEM_PANEL = """{% if page=='tech' and user.role in ('admin','manager') %}<section class='card'><h2>Raspberry Pi</h2><p class='label'>Beim Herunterfahren die Stromversorgung erst trennen, wenn der Pi vollständig aus ist.</p><div class='grid'><form method='post' action='/system/reboot'><button class='soft'>Neu starten</button></form><form method='post' action='/system/shutdown'><button class='danger'>Herunterfahren</button></form></div></section>{% endif %}"""
+SYSTEM_PANEL = """{% if page=='tech' and user.role=='admin' %}<section class='card'><h2>Raspberry Pi</h2><p class='label'>Beim Herunterfahren die Stromversorgung erst trennen, wenn der Pi vollständig aus ist. Admin-PIN erforderlich.</p><div class='grid'><form data-pin method='post' action='/system/reboot'><button class='soft'>Neu starten</button></form><form data-pin method='post' action='/system/shutdown'><button class='danger'>Herunterfahren</button></form></div></section>{% endif %}"""
 NEW_TEMPLATE = NEW_TEMPLATE.replace("</main>", SYSTEM_PANEL + "</main>")
 SALES_PANEL = """{% if page=='products' and user.role in ('admin','manager') %}<section class='card'><h2>Verkaufsstatistik</h2><p class='label'>Nur bezahlte Ausgaben zählen hier mit.</p>{% for n,s in slots %}<div class='slot'><b>{{s.name}}</b><div class='label'>{{s.sold|default(0)}} verkauft · {{s.sales_revenue_eur}} Umsatz</div></div>{% endfor %}{% if user.role=='admin' %}<form data-pin method='post' action='/tech/reset-sales'><button class='danger'>Statistik zurücksetzen</button></form>{% endif %}</section>{% endif %}{% if page=='home' and user.role in ('admin','manager') and issues %}<section class='card'><h2>Wartungshinweise</h2>{% for issue in issues %}<p class='label'>• {{issue}}</p>{% endfor %}<p class='label'>Am Display erscheint nur „Wartung nötig“ – die Details stehen hier.</p></section>{% endif %}"""
 NEW_TEMPLATE = NEW_TEMPLATE.replace("</main>", SALES_PANEL + "</main>")
+RECOVERY_PANEL = """{% if page=='tech' and user.role=='admin' and hardware_error %}<section class='card'><h2>Ausgabe prüfen</h2><p class='label'>{{hardware_error}} Prüfe den tatsächlichen Bestand und korrigiere ihn zuerst unter „Fächer“. Erst danach den Fehler bestätigen.</p><form data-pin method='post' action='/tech/acknowledge-hardware'><button class='danger'>Bestand geprüft · Fehler bestätigen</button></form></section>{% endif %}"""
+NEW_TEMPLATE = NEW_TEMPLATE.replace("</main>", RECOVERY_PANEL + "</main>")
 NEW_TEMPLATE = NEW_TEMPLATE.replace("{{revenue}} ct", "{{revenue_eur}}")
 
 @app.route("/")
@@ -482,12 +729,13 @@ def index():
         page = request.args.get("page", "home")
         if page not in ("home", "products", "service", "tech", "admin"): page = "home"
         slots_view = [(number, {**slot, "sales_revenue_eur": euro(slot.get("sales_revenue", 0))}) for number, slot in enumerate(state["slots"], 1)]
-        return render_template_string(NEW_TEMPLATE, page=page, status=status, operational=is_operational(), enabled=state["enabled"], credit=state["credit"], revenue=state["revenue"], revenue_eur=euro(state["revenue"]), selected=selected_slot + 1 if selected_slot is not None else None, key_status=key_status, slots=slots_view, user=current_user(), users=state.get("users", []), servo=list(enumerate(state.get("servo", []), 1)), audit=state.get("audit", []), selection_timeout=state.get("selection_timeout", 30), mega_status="verbunden" if ser is not None else "nicht verbunden", busy=vend_in_progress, issues=machine_issues())
+        return render_template_string(NEW_TEMPLATE, page=page, status=status, operational=is_operational(), enabled=state["enabled"], credit=state["credit"], revenue=state["revenue"], revenue_eur=euro(state["revenue"]), selected=selected_slot + 1 if selected_slot is not None else None, key_status=key_status, slots=slots_view, user=current_user(), users=state.get("users", []), servo=list(enumerate(state.get("servo", []), 1)), audit=state.get("audit", []), selection_timeout=state.get("selection_timeout", 30), mega_status="verbunden" if mega_ready else "nicht verbunden", busy=vend_in_progress, issues=machine_issues(), hardware_error=state["hardware_error"] or persistence_error)
 
 
 @app.post("/slot/<int:number>")
 @role_required("admin", "manager", "refill")
 def set_slot(number):
+    global selected_slot, selected_quantity, selection_changed_at
     if not 1 <= number <= SLOTS: return "Ungültiges Fach", 404
     with lock:
         slot = state["slots"][number - 1]
@@ -499,6 +747,11 @@ def set_slot(number):
             return redirect("/")
         slot["stock"] = max(0, stock)
         slot["price"] = max(1, price)
+        if selected_slot == number - 1 and selected_quantity > slot["stock"]:
+            selected_slot = None
+            selected_quantity = 0
+            selection_changed_at = 0.0
+            state["credit"] = 0
         audit(f"Fach {number} geändert")
         update_hardware()
     return return_to_page()
@@ -509,6 +762,8 @@ def set_slot(number):
 def toggle():
     global selected_slot, selected_quantity
     with lock:
+        if vend_in_progress:
+            return redirect("/")
         state["enabled"] = not state["enabled"]
         state["credit"] = 0
         selected_slot = None
@@ -523,6 +778,8 @@ def toggle():
 def reset_credit():
     global selected_slot, selected_quantity
     with lock:
+        if vend_in_progress:
+            return redirect("/")
         state["credit"] = 0
         selected_slot = None
         selected_quantity = 0
@@ -558,8 +815,9 @@ def configure_selection_timeout():
         seconds = int(request.form.get("seconds", "30"))
     except ValueError:
         return return_to_page()
-    state["selection_timeout"] = max(5, min(300, seconds))
-    audit(f"Auswahl-Timeout: {state['selection_timeout']} Sekunden")
+    with lock:
+        state["selection_timeout"] = max(5, min(300, seconds))
+        audit(f"Auswahl-Timeout: {state['selection_timeout']} Sekunden")
     return return_to_page()
 
 
@@ -578,31 +836,47 @@ def reset_sales():
 
 
 @app.post("/tech/free-vend/<int:number>")
-@role_required("admin", "manager")
+@role_required("admin")
 def free_vend(number):
-    global vend_in_progress, selected_slot
-    if not 1 <= number <= SLOTS or not admin_pin_ok() or vend_in_progress:
+    global vend_in_progress, selected_slot, selected_quantity
+    global pending_dispenses, active_dispense_slot, selection_changed_at
+    if not 1 <= number <= SLOTS or not admin_pin_ok():
         return redirect("/")
     with lock:
-        vend_in_progress = True; selected_slot = None
+        if (is_operational() or not mega_ready or vend_in_progress
+                or state["hardware_error"] or persistence_error):
+            return redirect("/")
+        audit(f"Gratis-Ausgabe Fach {number}")
+        vend_in_progress = True
+        selected_slot = None
+        selected_quantity = 0
+        selection_changed_at = 0.0
+        pending_dispenses = 1
+        active_dispense_slot = number - 1
         send("RELAY OFF"); send("LEDS OFF"); lcd("Gratis-Ausgabe", f"Fach {number}")
-        send(f"DISPENSE {number}"); audit(f"Gratis-Ausgabe Fach {number}")
+        send(f"DISPENSE {number}")
     return redirect("/")
 
 
 def service_required():
     # Tests sind im Wartungsmodus erlaubt: per Schluessel ODER Software-Sperre.
-    return is_operational() or vend_in_progress
+    return not mega_ready or (state["enabled"] and not service_mode) or vend_in_progress
 
 
 @app.post("/test/servo/<int:number>")
 @role_required("admin", "manager")
 def test_servo(number):
-    global vend_in_progress, selected_slot
-    if not 1 <= number <= SLOTS or service_required(): return redirect("/")
+    global vend_in_progress, selected_slot, selected_quantity
+    global pending_dispenses, active_dispense_slot, selection_changed_at
+    if not 1 <= number <= SLOTS: return redirect("/")
     with lock:
+        if service_required(): return redirect("/")
         vend_in_progress = True
         selected_slot = None
+        selected_quantity = 0
+        selection_changed_at = 0.0
+        pending_dispenses = 1
+        active_dispense_slot = number - 1
         send("RELAY OFF"); send("LEDS OFF")
         lcd("Servo-Test", f"Fach {number}")
         send(f"DISPENSE {number}")
@@ -612,8 +886,9 @@ def test_servo(number):
 @app.post("/test/leds/<int:number>")
 @role_required("admin", "manager")
 def test_leds(number):
-    if not 0 <= number <= SLOTS or service_required(): return redirect("/")
+    if not 0 <= number <= SLOTS: return redirect("/")
     with lock:
+        if service_required(): return redirect("/")
         send("LEDS OFF")
         if number == 0:
             for index in range(1, SLOTS + 1): send(f"LED {index} ON")
@@ -627,8 +902,9 @@ def test_leds(number):
 @app.post("/test/relay/<state_name>")
 @role_required("admin", "manager")
 def test_relay(state_name):
-    if state_name not in ("on", "off") or service_required(): return redirect("/")
+    if state_name not in ("on", "off"): return redirect("/")
     with lock:
+        if service_required(): return redirect("/")
         send(f"RELAY {state_name.upper()}")
         lcd("Relais-Test", "AN" if state_name == "on" else "AUS")
     return redirect("/")
@@ -637,8 +913,8 @@ def test_relay(state_name):
 @app.post("/test/lcd")
 @role_required("admin", "manager")
 def test_lcd():
-    if service_required(): return redirect("/")
     with lock:
+        if service_required(): return redirect("/")
         line1 = request.form.get("line1", "")[:16].replace("|", " ")
         line2 = request.form.get("line2", "")[:16].replace("|", " ")
         lcd(line1 or "LCD-Test", line2)
@@ -648,11 +924,33 @@ def test_lcd():
 @app.post("/test/reset")
 @role_required("admin", "manager")
 def reset_test():
-    if service_required(): return redirect("/")
     with lock:
+        if service_required(): return redirect("/")
         apply_servo_settings()
         update_hardware()
     return redirect("/")
+
+
+@app.post("/tech/acknowledge-hardware")
+@role_required("admin")
+def acknowledge_hardware_error():
+    global persistence_error
+    if not admin_pin_ok():
+        return return_to_page()
+    with lock:
+        if (not (service_mode or not state["enabled"]) or not mega_ready
+                or vend_in_progress or not (state["hardware_error"] or persistence_error)):
+            return return_to_page()
+        previous_error = state["hardware_error"]
+        state["hardware_error"] = ""
+        try:
+            audit("Hardware-Fehler nach Prüfung bestätigt")
+        except OSError:
+            state["hardware_error"] = previous_error
+            return "Speicherfehler besteht weiter; Zustand nicht bestätigt.", 503
+        persistence_error = ""
+        update_hardware()
+    return return_to_page()
 
 
 @app.get("/manifest.webmanifest")
@@ -678,10 +976,6 @@ if __name__ == "__main__":
             "siehe README.md."
         )
     load_state()
-    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.2)
-    time.sleep(2)  # Der Mega startet beim Oeffnen von USB oft neu.
     threading.Thread(target=serial_loop, daemon=True).start()
-    with lock:
-        update_hardware()
     threading.Timer(STARTUP_ANIMATION_SECONDS, finish_startup_animation).start()
     app.run(host="0.0.0.0", port=WEB_PORT, ssl_context=(TLS_CERT_FILE, TLS_KEY_FILE))

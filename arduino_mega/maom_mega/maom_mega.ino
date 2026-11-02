@@ -26,6 +26,7 @@ const unsigned long BUTTON_DEBOUNCE_MS = 35;
 const unsigned long COIN_GAP_MS = 350;
 const unsigned long STARTUP_CHASE_MS = 600;
 const unsigned long STARTUP_BLINK_MS = 700;
+const unsigned long PI_TIMEOUT_MS = 5000;
 
 // Diese Winkel beim mechanischen Test fuer jedes Fach kalibrieren.
 int homeAngle[5] = {0, 0, 0, 0, 0};
@@ -49,6 +50,7 @@ StartupPhase startupPhase = STARTUP_CHASE;
 byte startupStep = 0;
 bool startupBlinkOn = false;
 unsigned long startupChangedAt = 0;
+unsigned long lastPiCommandAt = 0;
 
 void sendLine(const char *text) {
   Serial.println(text);
@@ -129,6 +131,7 @@ void dispense(byte index) {
 }
 
 void processCommand(char *line) {
+  lastPiCommandAt = millis();
   if (strcmp(line, "STARTUP DONE") == 0) {
     startupPhase = STARTUP_DONE;
   } else if (strcmp(line, "RELAY ON") == 0) setRelay(true);
@@ -234,12 +237,14 @@ void setup() {
   lcd.init(); lcd.backlight(); showLcd("Automat startet", "Bitte warten");
   setLed(0, true);
   startupChangedAt = millis();
+  lastPiCommandAt = millis();
   sendLine("READY");
   sendLine(lastKeyState ? "KEY ON" : "KEY OFF");
 }
 
 void loop() {
   readSerial();
+  if (millis() - lastPiCommandAt >= PI_TIMEOUT_MS) setRelay(false);
   updateStartupAnimation();
   checkButtons();
   checkCoin();

@@ -48,6 +48,19 @@ Die Servo-Winkel stehen am Anfang von `maom_mega.ino` in `homeAngle` und `dispen
 
 ## 3. Raspberry Pi vorbereiten
 
+Für eine automatische Installation auf Raspberry Pi OS kann das mitgelieferte Skript verwendet werden. Es installiert Python, Abhängigkeiten, `mkcert`, HTTPS, den systemd-Dienst und die serielle Berechtigung:
+
+```sh
+cd Maoam-Automat
+sudo bash raspberry_pi/install_pi.sh \
+  --hostname raspberrypi.local \
+  --ip 192.168.178.50
+```
+
+Die IP-Adresse und der Hostname müssen durch die Werte deines Netzwerks ersetzt werden. Das Skript richtet absichtlich kein Benutzerkonto ein; beim ersten Aufruf im Browser wird der Administrator erstellt. Nach der Installation mit `systemctl status maom-automat` und `journalctl -u maom-automat -f` prüfen.
+
+Falls `mkcert` in deiner Raspberry-Pi-OS-Version nicht als Paket verfügbar ist, installiere es nach der offiziellen Anleitung und führe das Skript erneut aus.
+
 Schließe den Mega per USB an. Bei Raspberry Pi OS füge den Benutzer, unter dem der Server gestartet wird, der seriellen Gruppe hinzu und melde dich danach neu an:
 
 ```sh

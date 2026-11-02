@@ -1,3 +1,3 @@
 # Runtime dependencies for the Raspberry Pi server.
-Flask>=3.0,<4.0
+Flask>=3.1.3,<4.0
 pyserial>=3.5,<4.0

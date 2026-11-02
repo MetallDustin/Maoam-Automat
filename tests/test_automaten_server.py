@@ -336,6 +336,15 @@ class AutomatenServerTests(unittest.TestCase):
             with self.subTest(page=page):
                 self.assertEqual(self.client.get("/?page=" + page).status_code, 200)
 
+    def test_form_redirect_does_not_follow_external_referrer(self):
+        response = self.client.post(
+            "/reset-credit",
+            headers={"Referer": "https://example.com/steal"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+
     def test_first_admin_setup_and_login_flow(self):
         server.state["users"] = []
         server.state["admin_pin_hash"] = ""

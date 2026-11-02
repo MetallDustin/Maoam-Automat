@@ -524,9 +524,8 @@ def admin_pin_ok():
 
 
 def return_to_page():
-    """Nach Formularaktionen auf der aktuell geöffneten App-Seite bleiben."""
-    referrer = request.referrer or "/"
-    return redirect(referrer if referrer.startswith(request.host_url) else "/")
+    """Nach Formularaktionen auf die sichere Standardseite zurückkehren."""
+    return redirect("/")
 
 
 @app.before_request

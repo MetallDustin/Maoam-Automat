@@ -12,6 +12,8 @@ Arduino Mega: Ein-/Ausgabe und Motorsteuerung
         └── Servos, LEDs, Relais, LCD
 ```
 
+**Einsatzgrenze:** Die Anwendung ist für Bastler und abgesicherte lokale Netzwerke ausgelegt. Sie darf nicht direkt öffentlich aus dem Internet erreichbar sein; unbeaufsichtigter oder kommerzieller Betrieb erfordert zusätzliche Sicherheitsprüfungen und eine Produktionsbereitstellung des Webservers.
+
 ## Bausteine
 
 | Baustein | Pfad | Verantwortlichkeit |

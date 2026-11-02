@@ -2,6 +2,8 @@
 
 Steuerung für einen Snackautomaten mit Arduino Mega 2560 und Raspberry Pi. Die Weboberfläche läuft lokal über HTTPS; der Mega steuert Servos, Tasten, LEDs, Münzprüfer-Relais und I²C-LCD.
 
+> **Sicherheitshinweis:** Dieses Projekt ist für Bastler, Entwicklung und private Testaufbauten gedacht. Betreibe es nur in einem abgesicherten lokalen Netzwerk und stelle die Weboberfläche nicht direkt ins Internet. Für unbeaufsichtigten, öffentlichen oder kommerziellen Betrieb sind zusätzliche Sicherheits-, Elektro- und Funktionstests sowie eine geeignete Produktionsumgebung erforderlich.
+
 ## Schnellstart
 
 Die komplette Verdrahtungs-, Installations-, HTTPS- und Ersttest-Anleitung steht in **[docs/BUILD.md](docs/BUILD.md)**. Sie enthält auch die genauen Befehle zum Kompilieren und Hochladen der Arduino-Firmware.

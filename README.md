@@ -8,6 +8,14 @@ Steuerung für einen Snackautomaten mit Arduino Mega 2560 und Raspberry Pi. Die 
 
 Die komplette Verdrahtungs-, Installations-, HTTPS- und Ersttest-Anleitung steht in **[docs/BUILD.md](docs/BUILD.md)**. Sie enthält auch die genauen Befehle zum Kompilieren und Hochladen der Arduino-Firmware.
 
+Für Raspberry Pi OS gibt es einen automatischen Installer:
+
+```sh
+sudo bash raspberry_pi/install_pi.sh --hostname raspberrypi.local --ip 192.168.178.50
+```
+
+Danach ist der Dienst unter `https://raspberrypi.local:8443` erreichbar. Die Netzwerkadresse muss angepasst werden; Details und manuelle Schritte stehen in [docs/BUILD.md](docs/BUILD.md).
+
 ## Pinbelegung Mega
 
 | Bauteil | Pins |

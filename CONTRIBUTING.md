@@ -10,7 +10,7 @@ Vor einem Pull Request die Python-Tests und den Syntaxcheck ausführen:
 python -m pip install -r raspberry_pi/requirements.txt
 python -m unittest discover -s tests -v
 python3 -m py_compile raspberry_pi/automaten_server.py
-bash -n raspberry_pi/setup_local_https.sh raspberry_pi/maom-system-action
+bash -n raspberry_pi/setup_local_https.sh raspberry_pi/install_pi.sh raspberry_pi/maom-system-action
 ```
 
 Firmware-Build für den Mega 2560:

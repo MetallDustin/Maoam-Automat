@@ -29,24 +29,23 @@ Der Pi sendet regelmäßig einen Heartbeat. Wenn die Verbindung ausfällt, wird 
 - fünf Servos, Taster, LEDs mit Vorwiderständen, LCD, Schlüsselschalter und Münzprüfer
 - eine feste oder zuverlässig erreichbare lokale IP-Adresse des Pi
 
-Das Repository ist derzeit privat. Für den Download auf einem frischen Pi zuerst GitHub CLI installieren und anmelden:
+Das Repository kann direkt ohne GitHub-Anmeldung heruntergeladen werden:
 
 ```sh
 sudo apt update
-sudo apt install -y git gh avahi-daemon
+sudo apt install -y git avahi-daemon
 sudo systemctl enable --now avahi-daemon
-gh auth login
-```
-
-Danach Repository klonen:
-
-```sh
 cd ~
-gh repo clone MetallDustin/Maoam-Automat
+git clone https://github.com/MetallDustin/Maoam-Automat.git
 cd Maoam-Automat
 ```
 
-Bei einem öffentlichen Repository wäre alternativ `git clone https://github.com/MetallDustin/Maoam-Automat.git` möglich.
+Wenn du das Repository in ein bestimmtes Verzeichnis klonen möchtest:
+
+```sh
+git clone https://github.com/MetallDustin/Maoam-Automat.git ~/Maoam-Automat
+cd ~/Maoam-Automat
+```
 
 ### Automatische Installation
 

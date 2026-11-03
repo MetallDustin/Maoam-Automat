@@ -4,6 +4,14 @@ Diese Anleitung führt vom frischen Raspberry Pi bis zum vorsichtigen Ersttest. 
 
 > **Betriebsgrenze:** Der Aufbau ist für Bastler, Entwicklung und private Testaufbauten vorgesehen. Verwende ihn nur in einem abgesicherten lokalen Netzwerk hinter einer Firewall und ohne Portweiterleitung aus dem Internet. Der Flask-Entwicklungsserver ist nicht für einen öffentlichen oder kommerziellen Dauerbetrieb gedacht. Dafür sind zusätzliche Sicherheits-, Elektro- und Funktionstests sowie ein geeigneter Produktionsdienst erforderlich.
 
+## Projektaufbau
+
+Die folgenden Fotos zeigen den verwendeten Prototypen als Orientierung für die mechanische Anordnung. Sie ersetzen weder die Pinbelegung noch die Sicherheitsprüfung der eigenen Verdrahtung.
+
+![Fünf mechanische Ausgabefächer des Prototyps](images/automat-aufbau-2.jpg)
+
+![Geöffneter Prototyp mit Elektronik und Verdrahtung](images/automat-aufbau-1.jpg)
+
 ## 1. Teile und Verdrahtung
 
 Benötigt werden ein Arduino Mega 2560, ein Raspberry Pi, ein I²C-LCD mit PCF8574-Adapter, fünf Servos, fünf Taster, fünf LEDs mit Vorwiderständen, ein Schlüsselschalter und ein Münzprüfer mit passendem Relais-/Signalschnittstellenmodul.

@@ -4,6 +4,17 @@ Steuerung für einen Snackautomaten mit Arduino Mega 2560 und Raspberry Pi. Die 
 
 > **Sicherheitshinweis:** Dieses Projekt ist für Bastler, Entwicklung und private Testaufbauten gedacht. Betreibe es nur in einem abgesicherten lokalen Netzwerk und stelle die Weboberfläche nicht direkt ins Internet. Für unbeaufsichtigten, öffentlichen oder kommerziellen Betrieb sind zusätzliche Sicherheits-, Elektro- und Funktionstests sowie eine geeignete Produktionsumgebung erforderlich.
 
+## Projektbilder
+
+Der aktuelle Prototyp mit fünf Ausgabefächern und der Elektronik im Aufbau:
+
+<p>
+  <img src="docs/images/automat-aufbau-2.jpg" alt="Vorderansicht der fünf Ausgabefächer des MAOM-Automaten" width="49%">
+  <img src="docs/images/automat-aufbau-1.jpg" alt="Geöffneter MAOM-Automat mit Verdrahtung, Raspberry Pi und Elektronik" width="49%">
+</p>
+
+Die Fotos zeigen einen individuellen Prototypen. Verdrahtung, Netzteile, Befestigungen und mechanische Servoeinstellungen müssen beim eigenen Nachbau anhand der technischen Dokumentation geprüft und sicher ausgeführt werden.
+
 ## Was macht das Projekt?
 
 Der Raspberry Pi stellt die Weboberfläche und die Verkaufslogik bereit. Der Arduino Mega ist direkt mit der Hardware verbunden und steuert Taster, LEDs, Münzprüfer, LCD und Servos. Beide Geräte kommunizieren über USB-Seriell mit 9600 Baud.
